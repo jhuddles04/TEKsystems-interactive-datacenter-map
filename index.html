@@ -1,0 +1,28 @@
+create table public.regions ( 
+  id text primary key,             -- e.g., "US-CA" or "CA-ON"
+  name text,
+  details text,
+  color text check (color in ('blue','green','striped')),
+  updated_at timestamptz default now()
+);
+
+-- Row Level Security + open read/write for this demo.
+alter table public.regions enable row level security;
+
+-- Public read
+create policy "Public read"
+on public.regions for select
+to anon
+using (true);
+
+-- Public upsert (insert/update)
+create policy "Public upsert"
+on public.regions for insert
+to anon
+with check (true);
+
+create policy "Public update"
+on public.regions for update
+to anon
+using (true)
+with check (true); 
