@@ -1,28 +1,312 @@
-create table public.regions ( 
-  id text primary key,             -- e.g., "US-CA" or "CA-ON"
-  name text,
-  details text,
-  color text check (color in ('blue','green','striped')),
-  updated_at timestamptz default now()
-);
+<!doctype html> 
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Interactive Data Center Map (US + Mainland Canada)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
 
--- Row Level Security + open read/write for this demo.
-alter table public.regions enable row level security;
+  <!-- Leaflet CSS/JS -->
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha512-sA+e2T9r7...=="
+    crossorigin=""
+  />
+  <script
+    src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    integrity="sha512-nmmAqQ...=="
+    crossorigin=""
+  ></script>
 
--- Public read
-create policy "Public read"
-on public.regions for select
-to anon
-using (true);
+  <!-- TopoJSON client (to decode US TopoJSON to GeoJSON) -->
+  <script src="https://cdn.jsdelivr.net/npm/topojson-client@3.1.0/dist/topojson-client.min.js"></script>
 
--- Public upsert (insert/update)
-create policy "Public upsert"
-on public.regions for insert
-to anon
-with check (true);
+  <!-- Leaflet.pattern for striped fills -->
+  <script src="https://cdn.jsdelivr.net/npm/leaflet.pattern@0.1.0/dist/leaflet.pattern.min.js"></script>
 
-create policy "Public update"
-on public.regions for update
-to anon
-using (true)
-with check (true); 
+  <!-- Supabase JS -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+
+  <style>
+    html, body, #map { height: 100%; margin: 0; }
+    .info-panel {
+      position: absolute; right: 16px; top: 16px; z-index: 1000;
+      background: #fff; padding: 12px; border-radius: 8px;
+      box-shadow: 0 2px 12px rgba(0,0,0,.15); width: 300px; display: none;
+    }
+    .info-panel h3 { margin: 0 0 8px; font-size: 16px; }
+    .info-panel label { display:block; font-weight:600; margin-top:8px; }
+    .info-panel input, .info-panel textarea, .info-panel select {
+      width: 100%; box-sizing: border-box; padding: 8px; border:1px solid #ddd; border-radius:6px;
+    }
+    .row { display:flex; gap:8px; }
+    .row > * { flex:1; }
+    .buttons { margin-top:10px; display:flex; gap:8px; }
+    .btn {
+      cursor:pointer; border:0; border-radius:6px; padding:8px 10px; font-weight:600;
+    }
+    .btn.primary { background:#2563eb; color:#fff; }
+    .btn.secondary { background:#e5e7eb; }
+    .legend {
+      position:absolute; bottom:16px; left:16px; background:#fff; padding:8px 10px; border-radius:8px; font-size:13px; box-shadow:0 1px 8px rgba(0,0,0,.1);
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <!-- Floating edit/save panel -->
+  <div class="info-panel" id="panel">
+    <h3 id="panel-title">Edit</h3>
+    <div class="row">
+      <div>
+        <label for="name">Name</label>
+        <input id="name" placeholder="e.g., Northern VA (IAD)"/>
+      </div>
+      <div>
+        <label for="color">Color</label>
+        <select id="color">
+          <option value="">None</option>
+          <option value="blue">Blue</option>
+          <option value="green">Green</option>
+          <option value="striped">Blue & Green Striped</option>
+        </select>
+      </div>
+    </div>
+    <label for="details">Details</label>
+    <textarea id="details" rows="5" placeholder="Notes, capacity, tenants, fiber, power, etc."></textarea>
+    <div class="buttons">
+      <button class="btn secondary" id="cancelBtn">Close</button>
+      <button class="btn primary" id="saveBtn">Save</button>
+    </div>
+    <div id="saveStatus" style="margin-top:6px; font-size:12px; color:#059669; display:none;">Saved ✓</div>
+  </div>
+
+  <div class="legend">
+    <div><b>Click</b> a state/province to edit. Click the map to close.</div>
+  </div>
+
+<script>
+/** ---------- CONFIG: add your Supabase creds ---------- **/
+const SUPABASE_URL = "https://qzmkqyzwleqhjvvloajm.supabase.co";   // <-- paste
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InF6bWtxeXp3bGVxaGp2dmxvYWptIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjIyNjQ3NDYsImV4cCI6MjA3Nzg0MDc0Nn0.SVUwZbvPZY2XVG9Yo2lcZMq196oBfRR-yVKPjazxgaA";                      // <-- paste
+const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+/** ---------- Map setup ---------- **/
+const map = L.map('map').setView([40, -97], 4); // USA/Canada view
+
+// Free OSM tiles (remember attribution)
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 10,
+  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> contributors'
+}).addTo(map);
+
+/** ---------- Pattern for striped fill ---------- **/
+const stripePattern = new L.StripePattern({
+  weight: 6,        // stripe width
+  spaceWeight: 6,   // space between
+  color: '#2563eb', // blue stripes
+  opacity: 1
+});
+stripePattern.addTo(map);
+
+/** ---------- State style helpers ---------- **/
+function styleForColor(code) {
+  if (code === 'blue') return { fillColor: '#2563eb', color: '#1e40af', weight: 1, fillOpacity: 0.55 };
+  if (code === 'green') return { fillColor: '#16a34a', color: '#166534', weight: 1, fillOpacity: 0.55 };
+  if (code === 'striped') return { fillPattern: stripePattern, color: '#0f766e', weight: 1, fillOpacity: 1 };
+  return { fillColor: '#d1d5db', color: '#9ca3af', weight: 1, fillOpacity: 0.25 }; // default
+}
+
+/** ---------- Data layer containers ---------- **/
+let usLayer, caLayer;
+let featureIndex = {}; // { CODE: layer } for quick updates
+
+const panel = document.getElementById('panel');
+const panelTitle = document.getElementById('panel-title');
+const nameInput = document.getElementById('name');
+const detailsInput = document.getElementById('details');
+const colorSelect = document.getElementById('color');
+const saveBtn = document.getElementById('saveBtn');
+const cancelBtn = document.getElementById('cancelBtn');
+const saveStatus = document.getElementById('saveStatus');
+
+let activeLayer = null;
+let activeCode = null;  // e.g., 'CA' or 'ON'
+
+/** ---------- Load datasets (US TopoJSON + Canada provinces GeoJSON) ---------- **/
+// US states (TopoJSON): convert to GeoJSON
+// NOTE: We use the non-albers (lon/lat) dataset so Leaflet can render it.
+const US_TOPO_URL = "https://cdn.jsdelivr.net/npm/us-atlas@3/states-10m.json"; // source doc confirms this path
+// Canada provinces GeoJSON (community gist; we’ll filter Nunavut, Yukon, NWT)
+const CA_GEO_URL = "https://gist.githubusercontent.com/M1r1k/d5731bf39e1dfda5b53b4e4c560d968d/raw/canada_provinces.geo.json";
+
+Promise.all([
+  fetch(US_TOPO_URL).then(r => r.json()),
+  fetch(CA_GEO_URL).then(r => r.json()),
+  loadAllSavedColors()
+]).then(([usTopo, caGeo, savedMap]) => {
+  // US
+  const usGeo = topojson.feature(usTopo, usTopo.objects.states);
+  usLayer = L.geoJSON(usGeo, {
+    onEachFeature: perFeatureHandlers,
+    style: f => styleForColor(savedMap.get(codeForUS(f)) || '')
+  }).addTo(map);
+
+  // Build index for quick updates
+  usLayer.eachLayer(l => {
+    const code = codeForUS(l.feature);
+    featureIndex[code] = l;
+    l._featureCode = code;
+  });
+
+  // Canada — filter out Nunavut, Yukon, NWT
+  const EXCLUDE = new Set(['Nunavut','Yukon','Northwest Territories']);
+  const caFiltered = {
+    type: 'FeatureCollection',
+    features: caGeo.features.filter(f => !EXCLUDE.has(f.properties?.name || f.properties?.NAME))
+  };
+
+  caLayer = L.geoJSON(caFiltered, {
+    onEachFeature: perFeatureHandlers,
+    style: f => styleForColor(savedMap.get(codeForCA(f)) || '')
+  }).addTo(map);
+
+  caLayer.eachLayer(l => {
+    const code = codeForCA(l.feature);
+    featureIndex[code] = l;
+    l._featureCode = code;
+  });
+
+  // click-off to close
+  map.on('click', () => closePanel());
+}).catch(err => {
+  console.error(err);
+  alert("Error loading map data. Check console for details.");
+});
+
+/** ---------- Helpers to derive codes ---------- **/
+// US: state numeric ID -> USPS code map (from us-atlas docs)
+const US_ID_TO_CODE = {
+  "01":"AL","02":"AK","04":"AZ","05":"AR","06":"CA","08":"CO","09":"CT","10":"DE","11":"DC",
+  "12":"FL","13":"GA","15":"HI","16":"ID","17":"IL","18":"IN","19":"IA","20":"KS","21":"KY",
+  "22":"LA","23":"ME","24":"MD","25":"MA","26":"MI","27":"MN","28":"MS","29":"MO","30":"MT",
+  "31":"NE","32":"NV","33":"NH","34":"NJ","35":"NM","36":"NY","37":"NC","38":"ND","39":"OH",
+  "40":"OK","41":"OR","42":"PA","44":"RI","45":"SC","46":"SD","47":"TN","48":"TX","49":"UT",
+  "50":"VT","51":"VA","53":"WA","54":"WV","55":"WI","56":"WY"
+};
+function codeForUS(feature){ return US_ID_TO_CODE[String(feature.id).padStart(2,'0')] || null; }
+// Canada: use two-letter province/territory code if present, else derive by name
+const NAME_TO_CA_CODE = {
+  "Ontario":"ON","Quebec":"QC","Nova Scotia":"NS","New Brunswick":"NB","Manitoba":"MB",
+  "British Columbia":"BC","Prince Edward Island":"PE","Saskatchewan":"SK","Alberta":"AB",
+  "Newfoundland and Labrador":"NL"
+};
+function codeForCA(feature){
+  const p = feature.properties || {};
+  return p.abbrev || p.code || NAME_TO_CA_CODE[p.name || p.NAME] || null;
+}
+
+/** ---------- Per-feature interactivity ---------- **/
+function perFeatureHandlers(feature, layer){
+  layer.on({
+    click: (e) => {
+      L.DomEvent.stopPropagation(e); // don’t bubble to map
+      // zoom to clicked polygon
+      map.fitBounds(layer.getBounds(), { maxZoom: 7, padding: [20,20] });
+      openPanelFor(layer);
+    },
+    mouseover: () => layer.setStyle({ weight: 2 }),
+    mouseout: () => layer.setStyle({ weight: 1 })
+  });
+}
+
+function openPanelFor(layer){
+  activeLayer = layer;
+  activeCode = layer._featureCode || codeForUS(layer.feature) || codeForCA(layer.feature);
+
+  panel.style.display = 'block';
+  panelTitle.textContent = `Edit ${labelFor(layer.feature)}`;
+  // Load existing details from DB
+  getRecord(activeCode).then(rec => {
+    nameInput.value = rec?.name || '';
+    detailsInput.value = rec?.details || '';
+    colorSelect.value = rec?.color || '';
+  }).catch(()=>{ /* ignore */ });
+}
+
+function closePanel(){
+  panel.style.display = 'none';
+  activeLayer = null;
+  activeCode = null;
+}
+
+function labelFor(feature){
+  const p = feature.properties || {};
+  return p.name || p.NAME || p.state || p.province || activeCode || 'Region';
+}
+
+/** ---------- Save & load (Supabase) ---------- **/
+async function getRecord(code){
+  const { data, error } = await supabase
+    .from('regions')
+    .select('code,name,details,color')
+    .eq('code', code)
+    .maybeSingle();
+  if (error) { console.error(error); }
+  return data || null;
+}
+
+async function loadAllSavedColors(){
+  // Return a Map(code -> color) to speed up initial painting
+  const { data, error } = await supabase
+    .from('regions')
+    .select('code,color');
+  if (error) { console.warn('Could not prefetch colors (table may not exist yet).'); return new Map(); }
+  const m = new Map();
+  (data || []).forEach(r => m.set(r.code, r.color || ''));
+  return m;
+}
+
+async function saveRecord(code, name, details, color){
+  const { data, error } = await supabase
+    .from('regions')
+    .upsert({ code, name, details, color, updated_at: new Date().toISOString() }, { onConflict: 'code' })
+    .select();
+  if (error) throw error;
+  return data[0];
+}
+
+saveBtn.addEventListener('click', async () => {
+  if (!activeCode || !activeLayer) return;
+  const nameVal = nameInput.value.trim();
+  const detailsVal = detailsInput.value.trim();
+  const colorVal = colorSelect.value;
+
+  saveBtn.disabled = true;
+  try {
+    await saveRecord(activeCode, nameVal, detailsVal, colorVal);
+    // restyle polygon immediately
+    const style = styleForColor(colorVal);
+    if (style.fillPattern) { activeLayer.setStyle({ fillPattern: style.fillPattern, color: style.color, weight: style.weight, fillOpacity: style.fillOpacity }); }
+    else { activeLayer.setStyle(style); }
+    saveStatus.style.display = 'block';
+    setTimeout(()=> saveStatus.style.display = 'none', 1500);
+  } catch (e) {
+    alert('Save failed: ' + e.message);
+  } finally {
+    saveBtn.disabled = false;
+  }
+});
+
+cancelBtn.addEventListener('click', () => closePanel());
+</script>
+
+<!-- Notes:
+US states TopoJSON (Leaflet-friendly lon/lat) is fetched from us-atlas@3.
+Canada provinces GeoJSON is fetched from a public gist and filtered to mainland provinces.
+OpenStreetMap tiles are used with proper attribution.
+-->
+</body>
+</html>
+
